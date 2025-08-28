@@ -6,18 +6,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// OpenMeteo 的天气数据结构
-type WeatherData struct {
-	Hourly struct {
-		Temperature_2m []float64 `json:"temperature_2m"`
-		Cloudcover     []float64 `json:"cloudcover"`
-	} `json:"hourly"`
-	Current struct {
-		Sunset time.Time `json:"sunset"`
-	} `json:"current"`
+// 新的API响应数据结构
+type SunsetData struct {
+	TbAOD       string `json:"tb_aod"`        // 气溶胶光学厚度
+	TbEventTime string `json:"tb_event_time"` // 事件时间
+	TbQuality   string `json:"tb_quality"`    // 质量值，如 "0.047（微烧）"
 }
 
 // 企业微信消息结构
@@ -28,59 +26,110 @@ type WxMsg struct {
 	} `json:"text"`
 }
 
-// 获取上海的天气数据
-func getWeather() (WeatherData, error) {
-	// Open-Meteo API 的请求 URL
-	url := "https://api.open-meteo.com/v1/forecast?latitude=31.2304&longitude=121.4737&hourly=temperature_2m,cloudcover"
+// 获取火烧云数据
+func getSunsetData() (SunsetData, error) {
+	url := "https://sunsetbot.top/detailed/?query_id=4624758&intend=select_city&query_city=%E4%B8%8A%E6%B5%B7%E5%B8%82-%E4%B8%8A%E6%B5%B7&model=GFS&event_date=None&event=set_1&times=None"
 
 	// 发起 HTTP 请求
 	resp, err := http.Get(url)
 	if err != nil {
-		return WeatherData{}, err
+		return SunsetData{}, err
 	}
 	defer resp.Body.Close()
 
-	// 解析返回的天气数据
-	var data WeatherData
+	// 解析返回的数据
+	var data SunsetData
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return WeatherData{}, err
+		return SunsetData{}, err
 	}
 
 	return data, nil
 }
 
-// 判断是否有晚霞并返回晚霞等级
-func getSunsetQuality(cloudCoverage float64, sunsetTime time.Time) string {
-	// 判断当前时间是否接近日落时间
-	now := time.Now()
-	if now.After(sunsetTime) && now.Before(sunsetTime.Add(time.Hour)) {
-		// 如果是接近日落时间
-		if cloudCoverage > 50 {
-			return "无晚霞"
-		} else if cloudCoverage > 30 {
-			return "小烧"
-		} else if cloudCoverage > 10 {
-			return "中烧"
-		}
-		return "大烧"
+// 从质量字符串中提取数值部分
+func extractQualityValue(qualityStr string) (float64, error) {
+	// 提取数字部分（去掉括号和中文描述）
+	parts := strings.Split(qualityStr, "（")
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("无效的质量字符串格式")
 	}
-	return "无晚霞"
+
+	// 转换字符串为浮点数
+	value, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return value, nil
 }
 
-// 生成人性化提醒的消息内容
-func generateMessage(quality string) string {
-	var message string
-	switch quality {
-	case "无晚霞":
-		message = fmt.Sprintf("当前时间：%s\n今天的天气不太适合观赏晚霞，云层比较多，建议找点别的活动吧！🌥", time.Now().Format("2006-01-02 15:04:05"))
-	case "小烧":
-		message = fmt.Sprintf("当前时间：%s\n今晚的晚霞小有点烧，虽然不算壮丽，但也值得期待！如果有空，记得去看看天边的美丽色彩哦！🌇", time.Now().Format("2006-01-02 15:04:05"))
-	case "中烧":
-		message = fmt.Sprintf("当前时间：%s\n今晚的晚霞有些烧哦，天空中会有漂亮的橙红色，记得去享受一下这份美丽！⛅", time.Now().Format("2006-01-02 15:04:05"))
-	case "大烧":
-		message = fmt.Sprintf("当前时间：%s\n今晚的晚霞真的是大烧，天边的火红色太美了，赶快去看吧！🔥", time.Now().Format("2006-01-02 15:04:05"))
+// 根据质量值判断火烧云等级
+func determineQualityLevel(qualityValue float64) string {
+	switch {
+	case qualityValue < 0.05:
+		return "微微烧"
+	case qualityValue < 0.1:
+		return "小烧"
+	case qualityValue < 0.2:
+		return "小烧到中等烧"
+	case qualityValue < 0.3:
+		return "中等烧"
+	case qualityValue < 0.4:
+		return "中等烧到大烧"
+	case qualityValue < 0.5:
+		return "大烧"
+	case qualityValue < 0.6:
+		return "典型大烧"
+	case qualityValue < 0.7:
+		return "优质大烧"
 	default:
-		message = fmt.Sprintf("当前时间：%s\n天气数据获取失败，请稍后再试。", time.Now().Format("2006-01-02 15:04:05"))
+		return "世纪大烧"
+	}
+}
+
+// 生成更人性化的消息内容
+func generateMessage(quality string, eventTime string, aod string) string {
+	var message string
+
+	// 解析事件时间
+	eventTimeFormatted := eventTime
+	if eventTime != "" {
+		if parsedTime, err := time.Parse("2006-01-02 15:04:05", eventTime); err == nil {
+			eventTimeFormatted = parsedTime.Format("2006年01月02日 15:04")
+		}
+	}
+
+	switch quality {
+	case "微微烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n虽然今晚的火烧云只是微微烧，但工作再忙也别忘记抬头看看天空哦～\n\n天空中的每一刻都是独特的，即使没有绚丽的火烧云，傍晚的天空也值得您驻足片刻，让眼睛和心灵都休息一下。\n\nAOD值：%s (空气质量还不错)",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "小烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚有小烧火烧云，工作累了就看看窗外吧！天空会给你一个小小的惊喜～\n\n记得给自己几分钟的休息时间，欣赏一下天边的温柔色彩。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "小烧到中等烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚的火烧云有小烧到中等烧，是时候暂时放下手头工作，看看天空的表演了！\n\n别让忙碌的生活错过了这些自然的小美好。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "中等烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚的火烧云有中等烧，值得您抽出片刻时间欣赏！\n\n工作是做不完的，但美丽的晚霞转瞬即逝，别错过这份天空的礼物。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "中等烧到大烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚的火烧云有中等烧到大烧，天空即将上演精彩表演！\n\n再忙也要记得抬头看看，让美丽的天空为您的日常增添一抹色彩。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "大烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚有大烧火烧云！别再埋头工作了，天空正在为您准备一场视觉盛宴！\n\n这是放松身心的完美时刻，别错过这份大自然的慷慨馈赠。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "典型大烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚将出现典型的大烧晚霞！工作可以等等，但这样的天空美景不可错过！\n\n给自己一个短暂的休息，让绚丽的天空为您充电。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "优质大烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚是优质大烧晚霞！这是拍照和放松的最佳时机！\n\n工作是重要的，但生活中的美好瞬间同样珍贵。别让这样的天空美景在忙碌中溜走。\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	case "世纪大烧":
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n预测时间：%s\n\n今晚的火烧云是世纪大烧！绝对是难得一见的壮观景象！\n\n无论多忙，请务必抽出时间欣赏这份天空的奇迹。工作可以等，但这样的美景可能一年只有几次！\n\nAOD值：%s",
+			time.Now().Format("2006-01-02 15:04:05"), eventTimeFormatted, aod)
+	default:
+		message = fmt.Sprintf("🌅 火烧云预报 🌅\n当前时间：%s\n\n火烧云数据获取失败，但不管怎样，记得工作之余抬头看看天空，让眼睛和心灵都休息一下～",
+			time.Now().Format("2006-01-02 15:04:05"))
 	}
 	return message
 }
@@ -88,7 +137,7 @@ func generateMessage(quality string) string {
 // 发送消息到企业微信 Webhook
 func sendWxMsg(message string) error {
 	// 直接在代码中写死 Webhook URL
-	webhookURL := "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=c67b1bd4-823f-459c-8940-8a73e4499172"
+	webhookURL := "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=d87f2c6a-222a-43f6-91b8-5fbe251c8572"
 
 	// 构造发送的消息
 	wxMsg := WxMsg{
@@ -107,8 +156,46 @@ func sendWxMsg(message string) error {
 	return nil
 }
 
-// 定时任务：每天 5:30 PM 发送天气和晚霞消息
-func scheduleWeatherPush() {
+// 处理主动触发推送的HTTP请求
+func triggerPushHandler(w http.ResponseWriter, r *http.Request) {
+	// 获取火烧云数据
+	sunsetData, err := getSunsetData()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("获取火烧云数据失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// 提取质量数值
+	qualityValue, err := extractQualityValue(sunsetData.TbQuality)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("解析质量值失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// 判断火烧云等级
+	quality := determineQualityLevel(qualityValue)
+
+	// 生成消息内容
+	message := generateMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD)
+
+	// 发送消息到企业微信
+	if err := sendWxMsg(message); err != nil {
+		http.Error(w, fmt.Sprintf("发送消息失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// 返回成功响应
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "消息发送成功",
+		"quality": quality,
+	})
+}
+
+// 定时任务：每天 5:30 PM 发送火烧云消息
+func scheduleSunsetPush() {
 	// 计算明天下午 5:30 的时间
 	now := time.Now()
 	nextRun := time.Date(now.Year(), now.Month(), now.Day(), 17, 30, 0, 0, time.Local)
@@ -126,64 +213,45 @@ func scheduleWeatherPush() {
 
 	// 执行定时任务
 	for {
-		// 获取天气数据并推送消息
-		weather, err := getWeather()
+		// 获取火烧云数据
+		sunsetData, err := getSunsetData()
 		if err != nil {
-			log.Fatalf("获取天气数据失败: %v", err)
+			log.Printf("获取火烧云数据失败: %v", err)
+			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
+			continue
 		}
 
-		// 获取当前的云层覆盖度（假设我们取未来1小时的平均值）
-		avgCloudCover := weather.Hourly.Cloudcover[0]
+		// 提取质量数值
+		qualityValue, err := extractQualityValue(sunsetData.TbQuality)
+		if err != nil {
+			log.Printf("解析质量值失败: %v", err)
+			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
+			continue
+		}
 
-		// 判断晚霞情况
-		quality := getSunsetQuality(avgCloudCover, weather.Current.Sunset)
+		// 判断火烧云等级
+		quality := determineQualityLevel(qualityValue)
 
-		// 生成更人性化的消息内容
-		message := generateMessage(quality)
+		// 生成消息内容
+		message := generateMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD)
 
 		// 发送消息到企业微信
 		if err := sendWxMsg(message); err != nil {
-			log.Fatalf("发送消息失败: %v", err)
+			log.Printf("发送消息失败: %v", err)
+			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
+			continue
 		}
 
-		log.Println("消息发送成功！")
+		log.Println("消息发送成功")
 
-		// 每天执行一次
-		time.Sleep(24 * time.Hour) // 间隔24小时再次发送
+		// 等待24小时后再次执行
+		time.Sleep(24 * time.Hour)
 	}
-}
-
-// 主动触发推送：通过 HTTP 请求触发
-func triggerPushHandler(w http.ResponseWriter, r *http.Request) {
-	// 获取天气数据并推送消息
-	weather, err := getWeather()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("获取天气数据失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// 获取当前的云层覆盖度（假设我们取未来1小时的平均值）
-	avgCloudCover := weather.Hourly.Cloudcover[0]
-
-	// 判断晚霞情况
-	quality := getSunsetQuality(avgCloudCover, weather.Current.Sunset)
-
-	// 生成更人性化的消息内容
-	message := generateMessage(quality)
-
-	// 发送消息到企业微信
-	if err := sendWxMsg(message); err != nil {
-		http.Error(w, fmt.Sprintf("发送消息失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// 返回成功响应
-	w.Write([]byte("消息发送成功！"))
 }
 
 func main() {
 	// 启动定时任务
-	go scheduleWeatherPush()
+	go scheduleSunsetPush()
 
 	// 启动 HTTP 服务，允许主动触发发送消息
 	http.HandleFunc("/trigger-push", triggerPushHandler)

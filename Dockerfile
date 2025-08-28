@@ -1,27 +1,27 @@
-# 使用支持 Go 1.23 的官方 Go 语言镜像作为基础镜像
-FROM golang:1.23-alpine as build
+FROM golang:1.23-alpine AS builder
 
-# 设置工作目录
 WORKDIR /app
 
-# 将当前目录内容复制到工作目录
+# 复制依赖文件并下载依赖
+COPY go.mod .
+RUN go mod download
+
+# 复制源代码
 COPY . .
 
-# 下载依赖并编译 Go 项目
-RUN go mod tidy
-RUN go build -o sunset .
+# 编译应用
+RUN CGO_ENABLED=0 GOOS=linux go build -o sunset .
 
-# 使用 Alpine 镜像作为运行时环境
+# 使用轻量镜像运行
 FROM alpine:latest
 
-# 安装必要的依赖
-RUN apk --no-cache add ca-certificates
+WORKDIR /root/
 
-# 将编译好的程序复制到运行时镜像
-COPY --from=build /app/sunset /usr/local/bin/sunset
+# 从构建阶段复制编译好的应用
+COPY --from=builder /app/sunset .
 
-# 设置容器启动命令
-ENTRYPOINT ["/usr/local/bin/sunset"]
+# 暴露端口
+EXPOSE 8080
 
-# 设置容器默认运行时
-CMD []
+# 运行应用
+CMD ["./sunset"]
