@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  sunset:
+    build: .  # 基于当前目录的 Dockerfile 构建镜像
+    container_name: sunset-app
+    ports:
+      - "8080:8080"  # 映射容器端口到宿主机
+    restart: unless-stopped  # 容器退出时自动重启（除非手动停止）
+    environment:
+      - TZ=Asia/Shanghai  # 配置时区，确保定时任务时间准确
