@@ -282,70 +282,54 @@ func triggerPushHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 定时任务：每天 5:30 PM 发送火烧云消息
-func scheduleSunsetPush() {
-	// 计算明天下午 5:30 的时间
-	now := time.Now()
-	nextRun := time.Date(now.Year(), now.Month(), now.Day(), 17, 30, 0, 0, time.Local)
-	if now.After(nextRun) {
-		// 如果当前时间已经过了 5:30，则推迟到明天 5:30
-		nextRun = nextRun.Add(24 * time.Hour)
+// 推送一次火烧云消息
+func pushSunsetMsg() error {
+	sunsetData, err := getSunsetData()
+	if err != nil {
+		return fmt.Errorf("获取火烧云数据失败: %v", err)
 	}
+	qualityValue, err := extractQualityValue(sunsetData.TbQuality)
+	if err != nil {
+		return fmt.Errorf("解析质量值失败: %v", err)
+	}
+	quality := determineQualityLevel(qualityValue)
+	message := generateMarkdownMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD)
+	if err := sendWxMarkdownMsg(message); err != nil {
+		return fmt.Errorf("发送消息失败: %v", err)
+	}
+	return nil
+}
 
-	// 等待直到下一个定时推送
-	duration := nextRun.Sub(now)
-	log.Printf("下次推送将在 %s 后执行", duration)
-
-	// 等待直到下一个定时推送
-	time.Sleep(duration)
-
-	// 执行定时任务
+// 优化后的定时任务：每天指定时间推送火烧云消息
+func scheduleSunsetPush(hour, min int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("定时任务 panic: %v", r)
+		}
+	}()
 	for {
-		// 获取火烧云数据
-		sunsetData, err := getSunsetData()
-		if err != nil {
-			log.Printf("获取火烧云数据失败: %v", err)
-			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
+		now := time.Now()
+		nextRun := time.Date(now.Year(), now.Month(), now.Day(), hour, min, 0, 0, time.Local)
+		if now.After(nextRun) {
+			nextRun = nextRun.Add(24 * time.Hour)
+		}
+		duration := nextRun.Sub(now)
+		log.Printf("下次推送将在 %s (%s) 后执行", nextRun.Format("2006-01-02 15:04:05"), duration)
+		time.Sleep(duration)
+		if err := pushSunsetMsg(); err != nil {
+			log.Printf("定时推送失败: %v", err)
+			time.Sleep(1 * time.Hour)
 			continue
 		}
-
-		// 提取质量数值
-		qualityValue, err := extractQualityValue(sunsetData.TbQuality)
-		if err != nil {
-			log.Printf("解析质量值失败: %v", err)
-			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
-			continue
-		}
-
-		// 判断火烧云等级
-		quality := determineQualityLevel(qualityValue)
-
-		// 生成富文本消息内容
-		message := generateMarkdownMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD)
-
-		// 发送消息到企业微信
-		if err := sendWxMarkdownMsg(message); err != nil {
-			log.Printf("发送消息失败: %v", err)
-			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
-			continue
-		}
-
-		log.Println("富文本消息发送成功")
-
-		// 等待24小时后再次执行
+		log.Println("定时推送成功")
 		time.Sleep(24 * time.Hour)
 	}
 }
 
 func main() {
-	// 启动定时任务
-	go scheduleSunsetPush()
-
-	// 启动 HTTP 服务，允许主动触发发送消息
+	go scheduleSunsetPush(17, 30) // 可改为 go scheduleSunsetPush(时, 分) 方便测试
 	http.HandleFunc("/trigger-push", triggerPushHandler)
 	log.Println("HTTP 服务已启动，监听端口 8080...")
-
-	// 启动 HTTP 服务
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("启动 HTTP 服务失败: %v", err)
 	}
