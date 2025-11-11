@@ -20,7 +20,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sunset .
 FROM alpine:latest
 
 # 安装时区数据和 CA 证书（用于 HTTPS 请求）
-RUN apk --no-cache add ca-certificates tzdata
+RUN echo "http://mirrors.aliyun.com/alpine/v3.18/main" > /etc/apk/repositories && \
+    echo "http://mirrors.aliyun.com/alpine/v3.18/community" >> /etc/apk/repositories && \
+    apk update && \
+    apk --no-cache add ca-certificates tzdata
 
 # 设置工作目录
 WORKDIR /root/
