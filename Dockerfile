@@ -19,11 +19,17 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sunset .
 # 运行阶段
 FROM alpine:latest
 
+# 安装时区数据和 CA 证书（用于 HTTPS 请求）
+RUN apk --no-cache add ca-certificates tzdata
+
 # 设置工作目录
 WORKDIR /root/
 
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/sunset .
+
+# 设置时区环境变量（默认为上海时区）
+ENV TZ=Asia/Shanghai
 
 # 暴露端口（程序监听8080端口）
 EXPOSE 8080
