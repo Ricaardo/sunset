@@ -733,85 +733,105 @@ func executePushTask() error {
 
 	// 发送消息到企业微信
 	if err := sendWxMarkdownMsg(message); err != nil {
-		http.Error(w, fmt.Sprintf("发送消息失败: %v", err), http.StatusInternalServerError)
-		return
+		return fmt.Errorf("发送消息失败: %v", err)
 	}
 
-	// 返回成功响应
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "success",
-		"message": "消息发送成功",
-		"quality": quality,
-	})
+	log.Printf("消息发送成功 - 质量等级: %s", quality)
+	return nil
 }
 
-// 定时任务：每天 5:30 PM 发送火烧云消息
-func scheduleSunsetPush() {
-	// 计算明天下午 5:30 的时间
-	now := time.Now()
-	nextRun := time.Date(now.Year(), now.Month(), now.Day(), 17, 30, 0, 0, time.Local)
-	if now.After(nextRun) {
-		// 如果当前时间已经过了 5:30，则推迟到明天 5:30
-		nextRun = nextRun.Add(24 * time.Hour)
+// 计算下次推送时间
+func getNextPushTime() time.Time {
+	now := time.Now().In(beijingLocation)
+
+	if config.UseSunsetTime {
+		// 使用日落时间触发
+		sunsetTime := calculateSunsetTime(config.Latitude, config.Longitude, now)
+
+		// 提前指定分钟数推送
+		pushTime := sunsetTime.Add(-time.Duration(config.SunsetAdvanceMinutes) * time.Minute)
+
+		// 如果今天的推送时间已过，计算明天的日落时间
+		if now.After(pushTime) {
+			tomorrow := now.Add(24 * time.Hour)
+			sunsetTime = calculateSunsetTime(config.Latitude, config.Longitude, tomorrow)
+			pushTime = sunsetTime.Add(-time.Duration(config.SunsetAdvanceMinutes) * time.Minute)
+		}
+
+		log.Printf("使用日落时间触发模式 - 日落时间: %s, 推送时间: %s (提前 %d 分钟)",
+			sunsetTime.Format("2006-01-02 15:04:05"),
+			pushTime.Format("2006-01-02 15:04:05"),
+			config.SunsetAdvanceMinutes)
+		return pushTime
+	} else {
+		// 使用固定时间触发
+		nextRun := time.Date(now.Year(), now.Month(), now.Day(), config.ScheduleHour, config.ScheduleMinute, 0, 0, beijingLocation)
+
+		// 如果当前时间已经过了设定时间，则推迟到明天
+		if now.After(nextRun) {
+			nextRun = nextRun.Add(24 * time.Hour)
+		}
+
+		log.Printf("使用固定时间触发模式 - 下次推送时间: %s", nextRun.Format("2006-01-02 15:04:05"))
+		return nextRun
 	}
+}
 
-	// 等待直到下一个定时推送
-	duration := nextRun.Sub(now)
-	log.Printf("下次推送将在 %s 后执行", duration)
-
-	// 等待直到下一个定时推送
-	time.Sleep(duration)
-
-	// 执行定时任务
+// 定时任务：发送火烧云消息
+func scheduleSunsetPush() {
 	for {
-		// 获取火烧云数据
-		sunsetData, err := getSunsetData()
-		if err != nil {
-			log.Printf("获取火烧云数据失败: %v", err)
-			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
-			continue
+		// 计算下次推送时间
+		nextRun := getNextPushTime()
+		now := time.Now().In(beijingLocation)
+
+		// 计算等待时间
+		duration := nextRun.Sub(now)
+		log.Printf("距离下次推送还有: %s (将在 %s 执行)", duration, nextRun.Format("2006-01-02 15:04:05"))
+
+		// 等待直到下一个定时推送
+		time.Sleep(duration)
+
+		// 执行推送任务
+		log.Println("开始执行定时推送任务...")
+		if err := executePushTask(); err != nil {
+			log.Printf("推送任务失败: %v", err)
+			// 失败后等待10分钟再计算下次推送时间
+			time.Sleep(10 * time.Minute)
+		} else {
+			// 成功后等待1分钟，防止重复推送
+			time.Sleep(1 * time.Minute)
 		}
-
-		// 提取质量数值
-		qualityValue, err := extractQualityValue(sunsetData.TbQuality)
-		if err != nil {
-			log.Printf("解析质量值失败: %v", err)
-			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
-			continue
-		}
-
-		// 判断火烧云等级
-		quality := determineQualityLevel(qualityValue)
-
-		// 生成富文本消息内容
-		message := generateMarkdownMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD)
-
-		// 发送消息到企业微信
-		if err := sendWxMarkdownMsg(message); err != nil {
-			log.Printf("发送消息失败: %v", err)
-			time.Sleep(1 * time.Hour) // 失败后等待1小时再试
-			continue
-		}
-
-		log.Println("富文本消息发送成功")
-
-		// 等待24小时后再次执行
-		time.Sleep(24 * time.Hour)
 	}
 }
 
 func main() {
+	// 初始化配置
+	initConfig()
+
+	log.Println("========================================")
+	log.Println("火烧云推送服务启动中...")
+	log.Println("========================================")
+
 	// 启动定时任务
 	go scheduleSunsetPush()
 
-	// 启动 HTTP 服务，允许主动触发发送消息
-	http.HandleFunc("/trigger-push", triggerPushHandler)
-	log.Println("HTTP 服务已启动，监听端口 8080...")
+	// 注册 HTTP 路由
+	http.HandleFunc("/trigger-push", triggerPushHandler) // 主动触发推送
+	http.HandleFunc("/health", healthCheckHandler)       // 健康检查
+	http.HandleFunc("/config", configHandler)            // 查询配置
+	http.HandleFunc("/sunset-time", sunsetTimeHandler)   // 查询日落时间
 
 	// 启动 HTTP 服务
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	serverAddr := ":" + config.Port
+	log.Printf("HTTP 服务已启动，监听端口 %s", config.Port)
+	log.Println("可用的 API 端点:")
+	log.Printf("  - GET/POST  http://localhost:%s/trigger-push   主动触发推送", config.Port)
+	log.Printf("  - GET       http://localhost:%s/health         健康检查", config.Port)
+	log.Printf("  - GET       http://localhost:%s/config         查询配置", config.Port)
+	log.Printf("  - GET       http://localhost:%s/sunset-time    查询日落时间", config.Port)
+	log.Println("========================================")
+
+	if err := http.ListenAndServe(serverAddr, nil); err != nil {
 		log.Fatalf("启动 HTTP 服务失败: %v", err)
 	}
 }
