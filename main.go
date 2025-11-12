@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,8 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -73,6 +76,23 @@ func initConfig() {
 		Port:                 getEnv("PORT", "8080"),
 	}
 
+	// 验证配置参数
+	if config.ScheduleHour < 0 || config.ScheduleHour > 23 {
+		log.Fatalf("错误: SCHEDULE_HOUR 必须在 0-23 之间，当前值: %d", config.ScheduleHour)
+	}
+	if config.ScheduleMinute < 0 || config.ScheduleMinute > 59 {
+		log.Fatalf("错误: SCHEDULE_MINUTE 必须在 0-59 之间，当前值: %d", config.ScheduleMinute)
+	}
+	if config.SunsetAdvanceMinutes < 0 {
+		log.Fatalf("错误: SUNSET_ADVANCE_MINUTES 必须为非负数，当前值: %d", config.SunsetAdvanceMinutes)
+	}
+	if config.Latitude < -90 || config.Latitude > 90 {
+		log.Fatalf("错误: LATITUDE 必须在 -90 到 90 之间，当前值: %f", config.Latitude)
+	}
+	if config.Longitude < -180 || config.Longitude > 180 {
+		log.Fatalf("错误: LONGITUDE 必须在 -180 到 180 之间，当前值: %f", config.Longitude)
+	}
+
 	log.Printf("配置加载完成:")
 	log.Printf("  城市: %s", config.City)
 	log.Printf("  坐标: %.4f, %.4f", config.Latitude, config.Longitude)
@@ -98,6 +118,8 @@ func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
 			return intValue
+		} else {
+			log.Printf("警告: 环境变量 %s='%s' 无法解析为整数，使用默认值 %d", key, value, defaultValue)
 		}
 	}
 	return defaultValue
@@ -108,6 +130,8 @@ func getEnvFloat(key string, defaultValue float64) float64 {
 	if value := os.Getenv(key); value != "" {
 		if floatValue, err := strconv.ParseFloat(value, 64); err == nil {
 			return floatValue
+		} else {
+			log.Printf("警告: 环境变量 %s='%s' 无法解析为浮点数，使用默认值 %f", key, value, defaultValue)
 		}
 	}
 	return defaultValue
@@ -118,6 +142,8 @@ func getEnvBool(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		if boolValue, err := strconv.ParseBool(value); err == nil {
 			return boolValue
+		} else {
+			log.Printf("警告: 环境变量 %s='%s' 无法解析为布尔值，使用默认值 %v", key, value, defaultValue)
 		}
 	}
 	return defaultValue
@@ -196,19 +222,35 @@ func calculateSunsetTime(lat, lon float64, date time.Time) time.Time {
 	// 转换为北京时间（UTC+8）
 	beijingHours := utcHours + 8.0
 
-	// 处理跨天情况
-	for beijingHours < 0 {
-		beijingHours += 24
-		date = date.Add(-24 * time.Hour)
-	}
-	for beijingHours >= 24 {
-		beijingHours -= 24
-		date = date.Add(24 * time.Hour)
+	// 处理跨天情况（使用数学运算而不是循环，避免潜在的无限循环）
+	if beijingHours < 0 {
+		fullDays := int(-beijingHours/24) + 1
+		beijingHours += float64(fullDays * 24)
+		date = date.Add(time.Duration(-fullDays*24) * time.Hour)
+	} else if beijingHours >= 24 {
+		fullDays := int(beijingHours / 24)
+		beijingHours -= float64(fullDays * 24)
+		date = date.Add(time.Duration(fullDays*24) * time.Hour)
 	}
 
+	// 使用math.Round改善精度，并处理可能的越界情况
 	hour := int(beijingHours)
-	minute := int((beijingHours - float64(hour)) * 60)
-	second := int(((beijingHours-float64(hour))*60 - float64(minute)) * 60)
+	minute := int(math.Round((beijingHours - float64(hour)) * 60))
+	second := int(math.Round(((beijingHours-float64(hour))*60 - float64(minute)) * 60))
+
+	// 处理可能的越界情况
+	if second >= 60 {
+		second = 0
+		minute++
+	}
+	if minute >= 60 {
+		minute = 0
+		hour++
+	}
+	if hour >= 24 {
+		hour = 0
+		date = date.Add(24 * time.Hour)
+	}
 
 	return time.Date(date.Year(), date.Month(), date.Day(), hour, minute, second, 0, beijingLocation)
 }
@@ -454,10 +496,29 @@ func generateMarkdownMessage(quality string, eventTime string, aod string) strin
 	// 解析事件时间（日落时间），如果为空则使用当前日期的日落时间
 	var eventTimeFormatted string
 	if eventTime != "" {
-		if parsedTime, err := time.Parse("2006-01-02 15:04:05", eventTime); err == nil {
+		// 支持多种时间格式
+		formats := []string{
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05Z",
+			"2006-01-02T15:04:05",
+			"15:04:05",
+			"15:04",
+		}
+
+		var parsedTime time.Time
+		var parsed bool
+		for _, format := range formats {
+			if t, err := time.Parse(format, eventTime); err == nil {
+				parsedTime = t
+				parsed = true
+				break
+			}
+		}
+
+		if parsed {
 			eventTimeFormatted = parsedTime.Format("15:04")
 		} else {
-			// 如果解析失败，使用计算的日落时间
+			log.Printf("警告: 无法解析事件时间 '%s'，使用计算值", eventTime)
 			sunsetTime := calculateSunsetTime(config.Latitude, config.Longitude, now)
 			eventTimeFormatted = sunsetTime.Format("15:04")
 		}
@@ -612,7 +673,10 @@ func sendWxMarkdownMsg(message string) error {
 	wxMsg.Markdown.Content = message
 
 	// 发送消息
-	msgBody, _ := json.Marshal(wxMsg)
+	msgBody, err := json.Marshal(wxMsg)
+	if err != nil {
+		return fmt.Errorf("消息序列化失败: %w", err)
+	}
 	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(msgBody))
 	if err != nil {
 		return err
@@ -640,22 +704,26 @@ func triggerPushHandler(w http.ResponseWriter, r *http.Request) {
 	// 返回成功响应
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "success",
 		"message":   "消息发送成功",
 		"timestamp": time.Now().In(beijingLocation).Format("2006-01-02 15:04:05"),
-	})
+	}); err != nil {
+		log.Printf("HTTP响应编码失败: %v", err)
+	}
 }
 
 // 处理健康检查请求
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "ok",
 		"timestamp": time.Now().In(beijingLocation).Format("2006-01-02 15:04:05"),
 		"timezone":  "Asia/Shanghai (UTC+8)",
-	})
+	}); err != nil {
+		log.Printf("HTTP响应编码失败: %v", err)
+	}
 }
 
 // 处理配置查询请求
@@ -687,7 +755,9 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("HTTP响应编码失败: %v", err)
+	}
 }
 
 // 处理日落时间查询请求
@@ -702,13 +772,15 @@ func sunsetTimeHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"sunset_time":  todaySunset.Format("2006-01-02 15:04:05"),
 		"current_time": now.Format("2006-01-02 15:04:05"),
 		"latitude":     config.Latitude,
 		"longitude":    config.Longitude,
 		"city":         config.City,
-	})
+	}); err != nil {
+		log.Printf("HTTP响应编码失败: %v", err)
+	}
 }
 
 // 执行推送任务的核心逻辑
@@ -778,28 +850,47 @@ func getNextPushTime() time.Time {
 }
 
 // 定时任务：发送火烧云消息
-func scheduleSunsetPush() {
+func scheduleSunsetPush(ctx context.Context) {
 	for {
+		// 检查是否收到停止信号
+		select {
+		case <-ctx.Done():
+			log.Println("定时任务已停止")
+			return
+		default:
+		}
+
 		// 计算下次推送时间
 		nextRun := getNextPushTime()
 		now := time.Now().In(beijingLocation)
 
 		// 计算等待时间
 		duration := nextRun.Sub(now)
+
+		// 防止负数duration导致busy loop
+		if duration < 0 {
+			log.Printf("警告: 下次推送时间已过期，立即执行")
+			duration = 0
+		}
+
 		log.Printf("距离下次推送还有: %s (将在 %s 执行)", duration, nextRun.Format("2006-01-02 15:04:05"))
 
-		// 等待直到下一个定时推送
-		time.Sleep(duration)
-
-		// 执行推送任务
-		log.Println("开始执行定时推送任务...")
-		if err := executePushTask(); err != nil {
-			log.Printf("推送任务失败: %v", err)
-			// 失败后等待10分钟再计算下次推送时间
-			time.Sleep(10 * time.Minute)
-		} else {
-			// 成功后等待1分钟，防止重复推送
-			time.Sleep(1 * time.Minute)
+		// 使用select等待，以便可以响应停止信号
+		select {
+		case <-time.After(duration):
+			// 执行推送任务
+			log.Println("开始执行定时推送任务...")
+			if err := executePushTask(); err != nil {
+				log.Printf("推送任务失败: %v", err)
+				// 失败后等待10分钟再计算下次推送时间
+				time.Sleep(10 * time.Minute)
+			} else {
+				// 成功后等待1分钟，防止重复推送
+				time.Sleep(1 * time.Minute)
+			}
+		case <-ctx.Done():
+			log.Println("定时任务已停止")
+			return
 		}
 	}
 }
@@ -812,8 +903,12 @@ func main() {
 	log.Println("火烧云推送服务启动中...")
 	log.Println("========================================")
 
+	// 创建context用于控制goroutine生命周期
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// 启动定时任务
-	go scheduleSunsetPush()
+	go scheduleSunsetPush(ctx)
 
 	// 注册 HTTP 路由
 	http.HandleFunc("/trigger-push", triggerPushHandler) // 主动触发推送
@@ -821,8 +916,34 @@ func main() {
 	http.HandleFunc("/config", configHandler)            // 查询配置
 	http.HandleFunc("/sunset-time", sunsetTimeHandler)   // 查询日落时间
 
-	// 启动 HTTP 服务
+	// 创建HTTP服务器
 	serverAddr := ":" + config.Port
+	server := &http.Server{
+		Addr:         serverAddr,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// 设置信号处理器
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// 在goroutine中处理信号
+	go func() {
+		sig := <-sigChan
+		log.Printf("收到信号 %v，开始graceful shutdown...", sig)
+		cancel() // 停止定时任务
+
+		// 创建5秒超时的context用于shutdown
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP服务器shutdown错误: %v", err)
+		}
+	}()
+
 	log.Printf("HTTP 服务已启动，监听端口 %s", config.Port)
 	log.Println("可用的 API 端点:")
 	log.Printf("  - GET/POST  http://localhost:%s/trigger-push   主动触发推送", config.Port)
@@ -831,7 +952,10 @@ func main() {
 	log.Printf("  - GET       http://localhost:%s/sunset-time    查询日落时间", config.Port)
 	log.Println("========================================")
 
-	if err := http.ListenAndServe(serverAddr, nil); err != nil {
+	// 启动 HTTP 服务
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("启动 HTTP 服务失败: %v", err)
 	}
+
+	log.Println("HTTP 服务已关闭")
 }
