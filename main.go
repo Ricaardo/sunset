@@ -40,6 +40,28 @@ type SunsetData struct {
 	DisplayCityName string `json:"display_city_name"` // 显示的城市名称
 }
 
+// 天气数据结构（和风天气API）
+type WeatherData struct {
+	Code string `json:"code"`
+	Now  struct {
+		Text       string `json:"text"`       // 天气状况
+		Cloud      string `json:"cloud"`      // 云量，百分比
+		Precip     string `json:"precip"`     // 降水量
+		Humidity   string `json:"humidity"`   // 相对湿度
+		Vis        string `json:"vis"`        // 能见度
+	} `json:"now"`
+}
+
+// 天气影响因子
+type WeatherImpact struct {
+	IsRainy       bool    // 是否下雨
+	IsCloudy      bool    // 是否多云/阴天
+	CloudCoverage float64 // 云量百分比
+	RainAmount    float64 // 降水量
+	ImpactLevel   string  // 影响等级：none(无影响), slight(轻微), moderate(中等), severe(严重)
+	Description   string  // 天气描述
+}
+
 // 企业微信消息结构 - 支持 markdown 格式
 type WxMsg struct {
 	MsgType  string `json:"msgtype"`
@@ -274,6 +296,148 @@ func toJulianDay(t time.Time) float64 {
 	return jd
 }
 
+// 获取当前天气数据（使用Open-Meteo免费API）
+func getWeatherData() (WeatherData, error) {
+	// Open-Meteo API - 完全免费，无需API Key
+	// 文档: https://open-meteo.com/en/docs
+	apiURL := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%f&longitude=%f&current=temperature_2m,precipitation,cloud_cover,weather_code&timezone=Asia/Shanghai",
+		config.Latitude, config.Longitude)
+
+	log.Printf("请求天气API (Open-Meteo): %s", apiURL)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return WeatherData{}, fmt.Errorf("创建天气请求失败: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return WeatherData{}, fmt.Errorf("天气API请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return WeatherData{}, fmt.Errorf("天气API返回错误状态码: %d", resp.StatusCode)
+	}
+
+	// Open-Meteo响应结构
+	var openMeteoResp struct {
+		Current struct {
+			Temperature float64 `json:"temperature_2m"`
+			Precipitation float64 `json:"precipitation"`
+			CloudCover    float64 `json:"cloud_cover"`
+			WeatherCode   int     `json:"weather_code"`
+		} `json:"current"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&openMeteoResp); err != nil {
+		return WeatherData{}, fmt.Errorf("天气数据解析失败: %w", err)
+	}
+
+	// 将Open-Meteo数据转换为通用格式
+	data := WeatherData{
+		Code: "200", // 成功标记
+	}
+	data.Now.Cloud = fmt.Sprintf("%.0f", openMeteoResp.Current.CloudCover)
+	data.Now.Precip = fmt.Sprintf("%.1f", openMeteoResp.Current.Precipitation)
+	data.Now.Text = weatherCodeToText(openMeteoResp.Current.WeatherCode)
+
+	log.Printf("天气数据: %s, 云量: %s%%, 降水: %smm, 温度: %.1f°C",
+		data.Now.Text, data.Now.Cloud, data.Now.Precip, openMeteoResp.Current.Temperature)
+
+	return data, nil
+}
+
+// 将Open-Meteo天气代码转换为文字描述
+// 参考: https://open-meteo.com/en/docs
+func weatherCodeToText(code int) string {
+	switch code {
+	case 0:
+		return "晴朗"
+	case 1, 2, 3:
+		return "多云"
+	case 45, 48:
+		return "雾"
+	case 51, 53, 55:
+		return "毛毛雨"
+	case 56, 57:
+		return "冻雨"
+	case 61, 63, 65:
+		return "雨"
+	case 66, 67:
+		return "冻雨"
+	case 71, 73, 75:
+		return "雪"
+	case 77:
+		return "雪粒"
+	case 80, 81, 82:
+		return "阵雨"
+	case 85, 86:
+		return "阵雪"
+	case 95:
+		return "雷暴"
+	case 96, 99:
+		return "雷暴伴冰雹"
+	default:
+		return "未知"
+	}
+}
+
+// 分析天气对火烧云的影响
+func analyzeWeatherImpact(weather WeatherData) WeatherImpact {
+	impact := WeatherImpact{
+		Description: weather.Now.Text,
+	}
+
+	// 解析云量
+	if weather.Now.Cloud != "" {
+		cloudCoverage, err := strconv.ParseFloat(weather.Now.Cloud, 64)
+		if err == nil {
+			impact.CloudCoverage = cloudCoverage
+		}
+	}
+
+	// 解析降水量
+	if weather.Now.Precip != "" {
+		rainAmount, err := strconv.ParseFloat(weather.Now.Precip, 64)
+		if err == nil {
+			impact.RainAmount = rainAmount
+		}
+	}
+
+	// 判断是否下雨（降水量大于0）
+	impact.IsRainy = impact.RainAmount > 0
+
+	// 判断是否阴天（云量大于70%）
+	impact.IsCloudy = impact.CloudCoverage > 70
+
+	// 判断影响等级
+	if impact.IsRainy && impact.RainAmount > 5 {
+		// 大雨：严重影响
+		impact.ImpactLevel = "severe"
+	} else if impact.IsRainy || impact.CloudCoverage > 85 {
+		// 有降水或云量很高：中等影响
+		impact.ImpactLevel = "moderate"
+	} else if impact.IsCloudy {
+		// 多云/阴天：轻微影响
+		impact.ImpactLevel = "slight"
+	} else {
+		// 晴朗天气：无影响
+		impact.ImpactLevel = "none"
+	}
+
+	log.Printf("天气影响分析: 降雨=%v, 多云=%v, 云量=%.1f%%, 降水=%.1fmm, 影响等级=%s",
+		impact.IsRainy, impact.IsCloudy, impact.CloudCoverage, impact.RainAmount, impact.ImpactLevel)
+
+	return impact
+}
+
 // 获取火烧云数据
 func getSunsetData() (SunsetData, error) {
 	// 尝试使用详细API接口
@@ -487,8 +651,64 @@ func determineQualityLevel(qualityValue float64) string {
 	}
 }
 
+// 根据天气调整火烧云质量等级
+func adjustQualityByWeather(quality string, impact WeatherImpact) (string, string) {
+	// 如果天气无影响，返回原始质量
+	if impact.ImpactLevel == "none" {
+		return quality, ""
+	}
+
+	// 生成天气提示信息
+	var weatherNote string
+	switch impact.ImpactLevel {
+	case "severe":
+		weatherNote = fmt.Sprintf("\n\n> ⚠️ **天气提醒**：当前%s，降水量%.1fmm，预计火烧云效果将大幅减弱甚至无法观测。建议改日观赏。", impact.Description, impact.RainAmount)
+		// 严重影响：降级两个等级
+		quality = downgradeQuality(quality, 2)
+	case "moderate":
+		if impact.IsRainy {
+			weatherNote = fmt.Sprintf("\n\n> 🌧️ **天气提醒**：当前有降水（%.1fmm），可能会影响火烧云观测效果。", impact.RainAmount)
+		} else {
+			weatherNote = fmt.Sprintf("\n\n> ☁️ **天气提醒**：当前云量较高（%.0f%%），可能会遮挡部分火烧云。", impact.CloudCoverage)
+		}
+		// 中等影响：降级一个等级
+		quality = downgradeQuality(quality, 1)
+	case "slight":
+		weatherNote = fmt.Sprintf("\n\n> ⛅ **天气提醒**：当前云量%.0f%%，可能会略微影响火烧云的观赏效果。", impact.CloudCoverage)
+	}
+
+	return quality, weatherNote
+}
+
+// 降级火烧云质量等级
+func downgradeQuality(quality string, levels int) string {
+	qualityLevels := []string{"世纪大烧", "优质大烧", "典型大烧", "大烧", "中等烧到大烧", "中等烧", "小烧到中等烧", "小烧", "微微烧"}
+
+	// 找到当前等级
+	currentIndex := -1
+	for i, q := range qualityLevels {
+		if q == quality {
+			currentIndex = i
+			break
+		}
+	}
+
+	// 如果找不到或已经是最低级，返回原值或最低级
+	if currentIndex == -1 {
+		return quality
+	}
+
+	// 降级
+	newIndex := currentIndex + levels
+	if newIndex >= len(qualityLevels) {
+		return qualityLevels[len(qualityLevels)-1]
+	}
+
+	return qualityLevels[newIndex]
+}
+
 // 生成富文本卡片消息内容 (Markdown格式)
-func generateMarkdownMessage(quality string, eventTime string, aod string) string {
+func generateMarkdownMessage(quality string, eventTime string, aod string, weatherNote string) string {
 	// 获取当前北京时间
 	now := time.Now().In(beijingLocation)
 	currentTime := now.Format("2006-01-02 15:04:05")
@@ -596,7 +816,7 @@ func generateMarkdownMessage(quality string, eventTime string, aod string) strin
 **日落时间**：今天 %s
 **空气质量**：%s
 **推送时间**：%s
-
+%s
 ---
 
 %s
@@ -611,6 +831,7 @@ func generateMarkdownMessage(quality string, eventTime string, aod string) strin
 		eventTimeFormatted,
 		aod,
 		currentTime,
+		weatherNote,
 		getQualityDescription(quality),
 		getRandomTip())
 
@@ -799,16 +1020,35 @@ func executePushTask() error {
 
 	// 判断火烧云等级
 	quality := determineQualityLevel(qualityValue)
+	originalQuality := quality
+
+	// 获取天气数据并分析影响
+	weatherNote := ""
+	weatherData, err := getWeatherData()
+	if err != nil {
+		// 如果天气API失败，记录日志但继续执行（不影响主功能）
+		log.Printf("获取天气数据失败，将不考虑天气影响: %v", err)
+	} else {
+		// 分析天气影响
+		weatherImpact := analyzeWeatherImpact(weatherData)
+
+		// 根据天气调整火烧云质量
+		quality, weatherNote = adjustQualityByWeather(quality, weatherImpact)
+
+		if quality != originalQuality {
+			log.Printf("天气影响: 质量等级从 %s 调整为 %s", originalQuality, quality)
+		}
+	}
 
 	// 生成富文本消息内容
-	message := generateMarkdownMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD)
+	message := generateMarkdownMessage(quality, sunsetData.TbEventTime, sunsetData.TbAOD, weatherNote)
 
 	// 发送消息到企业微信
 	if err := sendWxMarkdownMsg(message); err != nil {
 		return fmt.Errorf("发送消息失败: %v", err)
 	}
 
-	log.Printf("消息发送成功 - 质量等级: %s", quality)
+	log.Printf("消息发送成功 - 原始质量等级: %s, 调整后质量等级: %s", originalQuality, quality)
 	return nil
 }
 
