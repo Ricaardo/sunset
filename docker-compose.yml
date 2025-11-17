@@ -17,5 +17,5 @@ services:
       - SCHEDULE_HOUR=17
       - SCHEDULE_MINUTE=15
       - USE_SUNSET_TIME=true  # 设置为 true 启用日落时间自动触发
-      - SUNSET_ADVANCE_MINUTES=15  # 日落前提前多少分钟推送（仅在 USE_SUNSET_TIME=true 时生效）
+      - SUNSET_ADVANCE_MINUTES=30  # 日落前提前多少分钟推送（仅在 USE_SUNSET_TIME=true 时生效）
       - PORT=8080
